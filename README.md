@@ -100,6 +100,12 @@ On the author's printer, all 81 cases had identical commands and row counts.
 - **"For general labels" (error diffusion, the default)** uses Brother's
   *measured* tone curve with Floyd–Steinberg. The dots form a different
   pattern, but the tone is the same: mean darkness differs by about 0.2%.
+- **Loaded media check:** like Brother's "Bi-Directional Communication", the
+  filter asks the printer what is loaded before printing. A die-cut size sent
+  to a continuous roll of the same width (for example "62 mm x 100 mm" on the
+  62 mm roll) prints as that length of continuous tape. Without this check
+  the printer stops with a red LED ("replace media"). This only happens when
+  CUPS is printing, so the offline comparison is unaffected.
 - **Deliberate differences:**
   - "Trim tape after data" really trims blank tape; Brother's filter didn't.
   - Copies are produced by macOS (`cupsManualCopies`), because Brother's

@@ -26,6 +26,7 @@
 #include <cups/cups.h>
 #include <cups/ppd.h>
 #include <cups/raster.h>
+#include <cups/sidechannel.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -307,6 +308,79 @@ static int strip_count(const char *name)
     return atoi(x + 1) > 1 ? atoi(x + 1) : 1;
 }
 
+/* What the printer reports is loaded (status reply bytes 10, 11, 17). */
+static struct {
+    int ok, width_mm, die_cut, length_mm, err1, err2;
+} loaded;
+
+/*
+ * Ask the printer what is loaded, the way Brother's driver does with
+ * "Bi-Directional Communication": send the documented status request and
+ * read the 32-byte reply through the CUPS back channel.  Only when CUPS is
+ * really printing (DEVICE_URI set); otherwise just send invalidate + ESC @.
+ */
+static void start_job(void)
+{
+    unsigned char nul[200] = { 0 }, st[32];
+    ssize_t n, got = 0;
+    int tries;
+
+    put(nul, sizeof nul);
+    put("\x1b@", 2);
+    if (!getenv("DEVICE_URI"))
+	return;
+    put("\x1biS", 3);
+    fflush(outfp);
+    for (tries = 0; tries < 10 && got < 32; tries++) {
+	n = cupsBackChannelRead((char *)st + got, sizeof st - (size_t)got, 0.5);
+	if (n > 0)
+	    got += n;
+    }
+    if (got < 32 || st[0] != 0x80 || st[1] != 0x20) {
+	fputs("DEBUG: No status reply from the printer; using the job's label size\n", stderr);
+	return;
+    }
+    loaded.ok = 1;
+    loaded.width_mm = st[10];
+    loaded.die_cut = st[11] == 0x0b;
+    loaded.length_mm = st[17];
+    loaded.err1 = st[8];
+    loaded.err2 = st[9];
+    fprintf(stderr, "DEBUG: Printer reports %d mm %s%s\n", loaded.width_mm,
+	    loaded.die_cut ? "die-cut labels" : "continuous tape",
+	    loaded.err1 || loaded.err2 ? " (with an error flagged)" : "");
+}
+
+/*
+ * Brother's driver prints a die-cut size on a continuous roll of the same
+ * width as that length of continuous tape (e.g. "62 mm x 100 mm" on the
+ * 62 mm roll).  Do the same, using the loaded media reported above.
+ */
+static const media_t *adapt_media(const media_t *m)
+{
+    char name[16];
+    const media_t *c;
+
+    if (!loaded.ok || !loaded.width_mm)
+	return m;
+    if (loaded.width_mm != m->width_mm) {
+	fprintf(stderr, "WARNING: The printer has %d mm %s loaded but the job is for %d mm\n",
+		loaded.width_mm, loaded.die_cut ? "labels" : "tape", m->width_mm);
+	return m;
+    }
+    if (m->die_cut && !loaded.die_cut) {
+	snprintf(name, sizeof name, "%dmm", m->width_mm);
+	if ((c = find_media(name)) && c->area_pins == m->area_pins && c->right_pins == m->right_pins) {
+	    fprintf(stderr, "INFO: Printing %d x %d mm label on the %d mm continuous roll\n",
+		    m->width_mm, m->length_mm, m->width_mm);
+	    return c;
+	}
+    }
+    if (!m->die_cut && loaded.die_cut)
+	fprintf(stderr, "WARNING: Die-cut labels are loaded but the job is for continuous tape\n");
+    return m;
+}
+
 static unsigned char *prev;	/* last label built, sent once we know if more follow */
 static size_t prev_len;
 static int labels;
@@ -398,7 +472,7 @@ int main(int argc, char **argv)
 
     while (cupsRasterReadHeader2(ras, &hdr)) {
 	const char *name = hdr.cupsPageSizeName[0] ? hdr.cupsPageSizeName : o.pagesize;
-	const media_t *m = find_media(name);
+	const media_t *m = find_media(name);	/* adjusted to the loaded roll below */
 	int W = (int)hdr.cupsWidth, H = (int)hdr.cupsHeight, y, k, n;
 	unsigned char *pagebuf;
 
@@ -426,11 +500,9 @@ int main(int argc, char **argv)
 				     hdr.cupsBytesPerLine) < 1)
 		break;
 
-	if (labels == 0) {
-	    unsigned char nul[200] = { 0 };
-	    put(nul, sizeof nul);
-	    put("\x1b@", 2);
-	}
+	if (labels == 0)
+	    start_job();
+	m = adapt_media(m);
 
 	/* wide "xK" pages print as K strips, right-hand strip first (as Brother does) */
 	n = m->die_cut ? 1 : strip_count(name);
